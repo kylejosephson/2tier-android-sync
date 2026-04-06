@@ -1,0 +1,100 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <!-- ===================================================== -->
+    <!-- REQUIRED PERMISSIONS -->
+    <!-- ===================================================== -->
+
+    <!-- 🔥 REQUIRED for OAuth + Microsoft Graph / OneDrive -->
+    <uses-permission android:name="android.permission.INTERNET" />
+
+    <!-- Media / storage access -->
+    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" />
+    <uses-permission android:name="android.permission.READ_MEDIA_AUDIO" />
+    <uses-permission
+        android:name="android.permission.MANAGE_EXTERNAL_STORAGE"
+        tools:ignore="ScopedStorage" />
+
+    <!-- Background audio / stability -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+
+    <!-- ✅ Required when using foregroundServiceType="mediaPlayback" on Android 14+ -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
+
+    <!-- ✅ Recommended for playback notifications on Android 13+ -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+
+    <!-- ===================================================== -->
+    <!-- APPLICATION -->
+    <!-- ===================================================== -->
+
+    <application
+        android:allowBackup="true"
+        android:dataExtractionRules="@xml/data_extraction_rules"
+        android:fullBackupContent="@xml/backup_rules"
+        android:icon="@mipmap/ic_launcher"
+        android:label="@string/app_name"
+        android:roundIcon="@mipmap/ic_launcher_round"
+        android:supportsRtl="true"
+        android:theme="@style/Theme.KylesMusicPlayerAndroid">
+
+        <!-- ================================================= -->
+        <!-- MediaSession Playback Service (Bluetooth/lockscreen) -->
+        <!-- ================================================= -->
+        <service
+            android:name=".data.service.MediaPlaybackService"
+            android:exported="false"
+            android:foregroundServiceType="mediaPlayback">
+            <intent-filter>
+                <action android:name="androidx.media3.session.MediaSessionService" />
+            </intent-filter>
+        </service>
+
+        <!-- ================================================= -->
+        <!-- OAuth Redirect Activity (Microsoft login callback) -->
+        <!-- ================================================= -->
+
+        <activity
+            android:name=".auth.OAuthRedirectActivity"
+            android:exported="true">
+
+            <intent-filter android:label="redirect">
+                <action android:name="android.intent.action.VIEW" />
+
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+
+                <!-- IMPORTANT:
+                     Manifest MUST use DECODED path
+                     Azure shows encoded (%3D)
+                     Android intent matching uses decoded -->
+                <data
+                    android:scheme="msauth"
+                    android:host="com.example.kylesmusicplayerandroid"
+                    android:path="/zjXQbhsVb1j3bsV7Nf2oQdD5ZQ8=" />
+            </intent-filter>
+        </activity>
+
+        <!-- ================================================= -->
+        <!-- Main Activity -->
+        <!-- ================================================= -->
+
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:screenOrientation="landscape"
+            android:resizeableActivity="false">
+
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+
+        </activity>
+
+    </application>
+
+</manifest>
