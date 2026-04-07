@@ -1,5 +1,6 @@
 package com.example.kylesmusicplayerandroid.data.localsync
 
+import android.util.Log
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -7,8 +8,7 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
 import org.json.JSONObject
-import java.io.BufferedReader
-import java.io.InputStreamReader
+import java.io.InputStream
 import java.io.OutputStream
 import java.net.InetSocketAddress
 import java.net.ServerSocket
@@ -21,13 +21,39 @@ class LocalSyncHttpServer(
     private val port: Int,
     private val onPing: (protocolVersion: Int?) -> Response,
     private val onManifest: () -> Response,
+    private val onReceiveFile: (query: Map<String, String>, body: ByteArray) -> Response,
+    private val onSendFile: (query: Map<String, String>) -> Response,
+    private val onDeleteFile: (query: Map<String, String>) -> Response,
     private val onRequestObserved: () -> Unit
 ) {
 
     data class Response(
         val statusCode: Int,
-        val body: JSONObject
+        val bodyBytes: ByteArray,
+        val contentType: String = "application/json; charset=utf-8",
+        val extraHeaders: Map<String, String> = emptyMap()
+    ) {
+        companion object {
+            fun json(statusCode: Int, body: JSONObject): Response {
+                return Response(
+                    statusCode = statusCode,
+                    bodyBytes = body.toString().toByteArray(StandardCharsets.UTF_8)
+                )
+            }
+        }
+    }
+
+    private data class Request(
+        val method: String,
+        val path: String,
+        val query: Map<String, String>,
+        val body: ByteArray
     )
+
+    companion object {
+        private const val TAG = "LocalSyncHttpServer"
+        private const val MAX_HEADER_BYTES = 64 * 1024
+    }
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private var serverSocket: ServerSocket? = null
@@ -77,57 +103,166 @@ class LocalSyncHttpServer(
         client.use { socket ->
             socket.soTimeout = 5000
 
-            val reader = BufferedReader(InputStreamReader(socket.getInputStream(), StandardCharsets.UTF_8))
-            val requestLine = reader.readLine().orEmpty()
-            if (requestLine.isBlank()) return
-
-            while (true) {
-                val line = reader.readLine() ?: break
-                if (line.isBlank()) break
-            }
-
-            val parts = requestLine.split(" ")
-            if (parts.size < 2) {
-                writeJson(socket.getOutputStream(), 400, JSONObject().put("ok", false).put("message", "Malformed request"))
+            val request = try {
+                parseRequest(socket.getInputStream())
+            } catch (t: Throwable) {
+                Log.e(TAG, "Failed to parse request", t)
+                writeResponse(
+                    socket.getOutputStream(),
+                    Response.json(
+                        400,
+                        JSONObject()
+                            .put("ok", false)
+                            .put("message", "Malformed request")
+                    )
+                )
                 return
             }
 
-            val method = parts[0].uppercase(Locale.US)
-            val rawTarget = parts[1]
-
-            if (method != "GET") {
-                writeJson(socket.getOutputStream(), 405, JSONObject().put("ok", false).put("message", "Method not allowed"))
-                return
-            }
-
-            val path = rawTarget.substringBefore('?')
-            val query = parseQuery(rawTarget.substringAfter('?', ""))
-
-            val response = when (path) {
+            val response = when (request.path) {
                 "/ping" -> {
-                    onRequestObserved()
-                    onPing(query["protocolVersion"]?.toIntOrNull())
+                    if (request.method != "GET") {
+                        Response.json(405, JSONObject().put("ok", false).put("message", "Method not allowed"))
+                    } else {
+                        onRequestObserved()
+                        onPing(request.query["protocolVersion"]?.toIntOrNull())
+                    }
                 }
+
                 "/manifest" -> {
-                    onRequestObserved()
-                    onManifest()
+                    if (request.method != "GET") {
+                        Response.json(405, JSONObject().put("ok", false).put("message", "Method not allowed"))
+                    } else {
+                        onRequestObserved()
+                        onManifest()
+                    }
                 }
-                else -> Response(
-                    statusCode = 404,
-                    body = JSONObject()
+
+                "/receive-file" -> {
+                    if (request.method != "POST") {
+                        Response.json(405, JSONObject().put("ok", false).put("message", "Method not allowed"))
+                    } else {
+                        onRequestObserved()
+                        onReceiveFile(request.query, request.body)
+                    }
+                }
+
+                "/send-file" -> {
+                    if (request.method != "GET") {
+                        Response.json(405, JSONObject().put("ok", false).put("message", "Method not allowed"))
+                    } else {
+                        onRequestObserved()
+                        onSendFile(request.query)
+                    }
+                }
+
+                "/delete-file" -> {
+                    if (request.method != "POST") {
+                        Response.json(405, JSONObject().put("ok", false).put("message", "Method not allowed"))
+                    } else {
+                        onRequestObserved()
+                        onDeleteFile(request.query)
+                    }
+                }
+
+                else -> Response.json(
+                    404,
+                    JSONObject()
                         .put("ok", false)
                         .put("message", "Not found")
                 )
             }
 
-            writeJson(socket.getOutputStream(), response.statusCode, response.body)
+            writeResponse(socket.getOutputStream(), response)
         }
     }
 
-    private fun writeJson(outputStream: OutputStream, statusCode: Int, body: JSONObject) {
-        val bodyBytes = body.toString().toByteArray(StandardCharsets.UTF_8)
-        val statusText = when (statusCode) {
+    private fun parseRequest(inputStream: InputStream): Request {
+        val headerBytes = readHeaders(inputStream)
+        val headerText = String(headerBytes, StandardCharsets.UTF_8)
+        val lines = headerText.split("\r\n")
+        val requestLine = lines.firstOrNull().orEmpty()
+        if (requestLine.isBlank()) {
+            throw IllegalArgumentException("Request line missing")
+        }
+
+        val parts = requestLine.split(" ")
+        if (parts.size < 2) {
+            throw IllegalArgumentException("Malformed request line")
+        }
+
+        val method = parts[0].uppercase(Locale.US)
+        val rawTarget = parts[1]
+        val contentLength = lines
+            .drop(1)
+            .mapNotNull { line ->
+                val colonIndex = line.indexOf(':')
+                if (colonIndex <= 0) return@mapNotNull null
+                val name = line.substring(0, colonIndex).trim().lowercase(Locale.US)
+                if (name != "content-length") return@mapNotNull null
+                line.substring(colonIndex + 1).trim().toIntOrNull()
+            }
+            .firstOrNull()
+            ?.coerceAtLeast(0)
+            ?: 0
+
+        val body = if (contentLength > 0) readExactly(inputStream, contentLength) else ByteArray(0)
+
+        return Request(
+            method = method,
+            path = rawTarget.substringBefore('?'),
+            query = parseQuery(rawTarget.substringAfter('?', "")),
+            body = body
+        )
+    }
+
+    private fun readHeaders(inputStream: InputStream): ByteArray {
+        val headerBuffer = ArrayList<Byte>(512)
+        var matched = 0
+
+        while (true) {
+            val next = inputStream.read()
+            if (next < 0) {
+                throw IllegalArgumentException("Unexpected EOF")
+            }
+
+            headerBuffer.add(next.toByte())
+            matched = when {
+                matched == 0 && next == '\r'.code -> 1
+                matched == 1 && next == '\n'.code -> 2
+                matched == 2 && next == '\r'.code -> 3
+                matched == 3 && next == '\n'.code -> 4
+                next == '\r'.code -> 1
+                else -> 0
+            }
+
+            if (matched == 4) break
+            if (headerBuffer.size > MAX_HEADER_BYTES) {
+                throw IllegalArgumentException("Headers too large")
+            }
+        }
+
+        return headerBuffer.toByteArrayCompat()
+    }
+
+    private fun readExactly(inputStream: InputStream, contentLength: Int): ByteArray {
+        val body = ByteArray(contentLength)
+        var offset = 0
+        while (offset < contentLength) {
+            val read = inputStream.read(body, offset, contentLength - offset)
+            if (read <= 0) {
+                throw IllegalArgumentException("Unexpected EOF in body")
+            }
+            offset += read
+        }
+        return body
+    }
+
+    private fun writeResponse(outputStream: OutputStream, response: Response) {
+        val bodyBytes = response.bodyBytes
+        val statusText = when (response.statusCode) {
             200 -> "OK"
+            201 -> "Created"
             400 -> "Bad Request"
             404 -> "Not Found"
             405 -> "Method Not Allowed"
@@ -137,9 +272,12 @@ class LocalSyncHttpServer(
         }
 
         val headers = buildString {
-            append("HTTP/1.1 $statusCode $statusText\r\n")
-            append("Content-Type: application/json; charset=utf-8\r\n")
+            append("HTTP/1.1 ${response.statusCode} $statusText\r\n")
+            append("Content-Type: ${response.contentType}\r\n")
             append("Content-Length: ${bodyBytes.size}\r\n")
+            response.extraHeaders.forEach { (key, value) ->
+                append("$key: $value\r\n")
+            }
             append("Connection: close\r\n")
             append("\r\n")
         }.toByteArray(StandardCharsets.UTF_8)
@@ -147,6 +285,14 @@ class LocalSyncHttpServer(
         outputStream.write(headers)
         outputStream.write(bodyBytes)
         outputStream.flush()
+    }
+
+    private fun ArrayList<Byte>.toByteArrayCompat(): ByteArray {
+        val bytes = ByteArray(size)
+        for (index in indices) {
+            bytes[index] = this[index]
+        }
+        return bytes
     }
 
     private fun parseQuery(rawQuery: String): Map<String, String> {

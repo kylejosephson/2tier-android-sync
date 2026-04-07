@@ -98,3 +98,6 @@ sdcard_index_hashes.txt
 
 app/release/
 baselineProfiles/
+
+# Test artifacts
+downloaded-*.mp3

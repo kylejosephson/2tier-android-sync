@@ -31,6 +31,10 @@ import com.example.kylesmusicplayerandroid.data.mediastore.MediaStoreScanner
 import com.example.kylesmusicplayerandroid.data.mediastore.MediaStoreSong
 import com.example.kylesmusicplayerandroid.data.service.MediaPlaybackService
 import com.example.kylesmusicplayerandroid.data.storage.SdCardIndex
+import com.example.kylesmusicplayerandroid.data.storage.ensureParentDirectories
+import com.example.kylesmusicplayerandroid.data.storage.guessMimeTypeFromFileName
+import com.example.kylesmusicplayerandroid.data.storage.parseManagedRelativePath
+import com.example.kylesmusicplayerandroid.data.storage.resolveRelativeDocument
 import com.example.kylesmusicplayerandroid.data.sync.OneDriveIndex
 import com.example.kylesmusicplayerandroid.data.sync.PlaylistSyncInfo
 import com.example.kylesmusicplayerandroid.data.sync.SongSyncInfo
@@ -589,6 +593,9 @@ class AppViewModel(
                         port = LOCAL_SYNC_PORT,
                         onPing = { protocolVersion -> buildPingResponse(protocolVersion) },
                         onManifest = { buildManifestResponse() },
+                        onReceiveFile = { query, body -> buildReceiveFileResponse(query, body) },
+                        onSendFile = { query -> buildSendFileResponse(query) },
+                        onDeleteFile = { query -> buildDeleteFileResponse(query) },
                         onRequestObserved = { markDesktopRequestObserved() }
                     )
                 }
@@ -648,30 +655,95 @@ class AppViewModel(
         stopSyncMode()
     }
 
+    private data class ManagedRootAccess(
+        val context: Context,
+        val root: DocumentFile
+    )
+
     private fun markDesktopRequestObserved() {
         val current = _localSyncUiState.value
         if (!current.syncModeActive) return
 
         _localSyncUiState.value = current.copy(
             serverStatus = SyncServerStatus.CONNECTED,
-            statusMessage = "Desktop handshake received."
+            statusMessage = "Desktop request received."
         )
+    }
+
+    private fun jsonResponse(statusCode: Int, body: JSONObject): LocalSyncHttpServer.Response {
+        return LocalSyncHttpServer.Response.json(statusCode, body)
+    }
+
+    private fun withManagedRootForFileAction(
+        actionName: String,
+        block: (ManagedRootAccess) -> LocalSyncHttpServer.Response
+    ): LocalSyncHttpServer.Response {
+        val ctx = appContext
+        val state = _localSyncUiState.value
+
+        if (ctx == null) {
+            Log.e(TAG, "$actionName failed: Android context unavailable")
+            return jsonResponse(
+                500,
+                JSONObject()
+                    .put("ok", false)
+                    .put("message", "Android context unavailable")
+            )
+        }
+
+        if (!state.syncModeActive) {
+            Log.w(TAG, "$actionName rejected: sync mode not active")
+            return jsonResponse(
+                409,
+                JSONObject()
+                    .put("ok", false)
+                    .put("message", "Sync mode is not active")
+            )
+        }
+
+        if (!state.managedRootSelected || state.managedRootUri.isNullOrBlank()) {
+            Log.w(TAG, "$actionName rejected: managed root missing")
+            return jsonResponse(
+                409,
+                JSONObject()
+                    .put("ok", false)
+                    .put("message", "Managed root not selected")
+            )
+        }
+
+        val root = try {
+            DocumentFile.fromTreeUri(ctx, Uri.parse(state.managedRootUri))
+        } catch (t: Throwable) {
+            Log.e(TAG, "$actionName failed: managed root unavailable", t)
+            null
+        }
+
+        if (root == null) {
+            return jsonResponse(
+                500,
+                JSONObject()
+                    .put("ok", false)
+                    .put("message", "Managed root is unavailable")
+            )
+        }
+
+        return block(ManagedRootAccess(context = ctx, root = root))
     }
 
     private fun buildPingResponse(protocolVersion: Int?): LocalSyncHttpServer.Response {
         if (protocolVersion != null && protocolVersion != SYNC_PROTOCOL_VERSION) {
-            return LocalSyncHttpServer.Response(
-                statusCode = 400,
-                body = JSONObject()
+            return jsonResponse(
+                400,
+                JSONObject()
                     .put("ok", false)
                     .put("message", "Protocol version mismatch")
             )
         }
 
         val state = _localSyncUiState.value
-        return LocalSyncHttpServer.Response(
-            statusCode = 200,
-            body = JSONObject()
+        return jsonResponse(
+            200,
+            JSONObject()
                 .put("ok", true)
                 .put("message", "Android sync server ready")
                 .put("protocolVersion", SYNC_PROTOCOL_VERSION)
@@ -688,36 +760,36 @@ class AppViewModel(
         val state = _localSyncUiState.value
 
         if (ctx == null) {
-            return LocalSyncHttpServer.Response(
-                statusCode = 500,
-                body = JSONObject()
+            return jsonResponse(
+                500,
+                JSONObject()
                     .put("ok", false)
                     .put("message", "Android context unavailable")
             )
         }
 
         if (!state.syncModeActive) {
-            return LocalSyncHttpServer.Response(
-                statusCode = 409,
-                body = JSONObject()
+            return jsonResponse(
+                409,
+                JSONObject()
                     .put("ok", false)
                     .put("message", "Sync mode is not active")
             )
         }
 
         if (!state.managedRootSelected || state.managedRootUri.isNullOrBlank()) {
-            return LocalSyncHttpServer.Response(
-                statusCode = 409,
-                body = JSONObject()
+            return jsonResponse(
+                409,
+                JSONObject()
                     .put("ok", false)
                     .put("message", "Managed root not selected")
             )
         }
 
         if (!state.initialSyncComplete) {
-            return LocalSyncHttpServer.Response(
-                statusCode = 409,
-                body = JSONObject()
+            return jsonResponse(
+                409,
+                JSONObject()
                     .put("ok", false)
                     .put("message", "Initial sync not complete")
             )
@@ -737,9 +809,9 @@ class AppViewModel(
                 )
             }
 
-            LocalSyncHttpServer.Response(
-                statusCode = 200,
-                body = JSONObject()
+            jsonResponse(
+                200,
+                JSONObject()
                     .put("ok", true)
                     .put("message", "Manifest generated successfully")
                     .put(
@@ -753,12 +825,301 @@ class AppViewModel(
             )
         } catch (t: Throwable) {
             Log.e(TAG, "Manifest refresh failed", t)
-            LocalSyncHttpServer.Response(
-                statusCode = 500,
-                body = JSONObject()
+            jsonResponse(
+                500,
+                JSONObject()
                     .put("ok", false)
                     .put("message", t.message ?: "Manifest refresh failure")
             )
+        }
+    }
+
+    private fun buildReceiveFileResponse(
+        query: Map<String, String>,
+        body: ByteArray
+    ): LocalSyncHttpServer.Response {
+        val rawRelativePath = query["relativePath"]
+        Log.i(TAG, "receive-file requested for relative path=${rawRelativePath.orEmpty()}")
+
+        val relativePath = parseManagedRelativePath(rawRelativePath)
+            ?: run {
+                Log.w(TAG, "receive-file rejected: invalid path=${rawRelativePath.orEmpty()}")
+                return jsonResponse(
+                    400,
+                    JSONObject()
+                        .put("ok", false)
+                        .put("message", "Invalid relative path")
+                        .put("relativePath", rawRelativePath ?: JSONObject.NULL)
+                )
+            }
+
+        val expectedSizeRaw = query["expectedSize"]
+        val expectedSize = when {
+            expectedSizeRaw.isNullOrBlank() -> null
+            else -> expectedSizeRaw.toLongOrNull()
+        }
+        if (!expectedSizeRaw.isNullOrBlank() && expectedSize == null) {
+            return jsonResponse(
+                400,
+                JSONObject()
+                    .put("ok", false)
+                    .put("message", "Invalid expectedSize")
+                    .put("relativePath", relativePath.normalizedPath)
+            )
+        }
+
+        val overwrite = query["overwrite"]?.equals("true", ignoreCase = true) == true
+
+        if (expectedSize != null && expectedSize != body.size.toLong()) {
+            Log.w(TAG, "receive-file rejected: expectedSize mismatch for ${relativePath.normalizedPath}")
+            return jsonResponse(
+                400,
+                JSONObject()
+                    .put("ok", false)
+                    .put("message", "Request body size does not match expectedSize")
+                    .put("relativePath", relativePath.normalizedPath)
+                    .put("expectedSize", expectedSize)
+                    .put("actualSize", body.size)
+            )
+        }
+
+        return withManagedRootForFileAction("receive-file") { access ->
+            try {
+                val existing = resolveRelativeDocument(access.root, relativePath)
+                if (existing != null && existing.isDirectory) {
+                    Log.w(TAG, "receive-file conflict: target path is a directory ${relativePath.normalizedPath}")
+                    return@withManagedRootForFileAction jsonResponse(
+                        409,
+                        JSONObject()
+                            .put("ok", false)
+                            .put("message", "Target path already exists as a directory")
+                            .put("relativePath", relativePath.normalizedPath)
+                            .put("conflict", true)
+                    )
+                }
+
+                val overwriting = existing != null
+                if (overwriting && !overwrite) {
+                    Log.w(TAG, "receive-file conflict: existing file ${relativePath.normalizedPath}")
+                    return@withManagedRootForFileAction jsonResponse(
+                        409,
+                        JSONObject()
+                            .put("ok", false)
+                            .put("message", "File already exists")
+                            .put("relativePath", relativePath.normalizedPath)
+                            .put("conflict", true)
+                            .put("created", false)
+                            .put("overwritten", false)
+                    )
+                }
+
+                val parentDir = ensureParentDirectories(access.root, relativePath)
+                    ?: return@withManagedRootForFileAction jsonResponse(
+                        500,
+                        JSONObject()
+                            .put("ok", false)
+                            .put("message", "Unable to create parent folders")
+                            .put("relativePath", relativePath.normalizedPath)
+                    )
+
+                val target = existing ?: parentDir.createFile(
+                    guessMimeTypeFromFileName(relativePath.fileName),
+                    relativePath.fileName
+                )
+
+                if (target == null) {
+                    Log.e(TAG, "receive-file failed: could not create file ${relativePath.normalizedPath}")
+                    return@withManagedRootForFileAction jsonResponse(
+                        500,
+                        JSONObject()
+                            .put("ok", false)
+                            .put("message", "Unable to create target file")
+                            .put("relativePath", relativePath.normalizedPath)
+                    )
+                }
+
+                val wrote = access.context.contentResolver.openOutputStream(target.uri, "w")?.use { output ->
+                    output.write(body)
+                    output.flush()
+                    true
+                } ?: false
+
+                if (!wrote) {
+                    Log.e(TAG, "receive-file failed: SAF write failure ${relativePath.normalizedPath}")
+                    return@withManagedRootForFileAction jsonResponse(
+                        500,
+                        JSONObject()
+                            .put("ok", false)
+                            .put("message", "SAF write failure")
+                            .put("relativePath", relativePath.normalizedPath)
+                    )
+                }
+
+                Log.i(TAG, "receive-file success: ${relativePath.normalizedPath}")
+                jsonResponse(
+                    if (overwriting) 200 else 201,
+                    JSONObject()
+                        .put("ok", true)
+                        .put("message", if (overwriting) "File overwritten" else "File created")
+                        .put("relativePath", relativePath.normalizedPath)
+                        .put("action", if (overwriting) "overwritten" else "created")
+                        .put("created", !overwriting)
+                        .put("overwritten", overwriting)
+                        .put("sizeBytes", body.size)
+                )
+            } catch (t: Throwable) {
+                Log.e(TAG, "receive-file failed for ${relativePath.normalizedPath}", t)
+                jsonResponse(
+                    500,
+                    JSONObject()
+                        .put("ok", false)
+                        .put("message", t.message ?: "Receive file failed")
+                        .put("relativePath", relativePath.normalizedPath)
+                )
+            }
+        }
+    }
+
+    private fun buildSendFileResponse(query: Map<String, String>): LocalSyncHttpServer.Response {
+        val rawRelativePath = query["relativePath"]
+        Log.i(TAG, "send-file requested for relative path=${rawRelativePath.orEmpty()}")
+
+        val relativePath = parseManagedRelativePath(rawRelativePath)
+            ?: run {
+                Log.w(TAG, "send-file rejected: invalid path=${rawRelativePath.orEmpty()}")
+                return jsonResponse(
+                    400,
+                    JSONObject()
+                        .put("ok", false)
+                        .put("message", "Invalid relative path")
+                        .put("relativePath", rawRelativePath ?: JSONObject.NULL)
+                )
+            }
+
+        return withManagedRootForFileAction("send-file") { access ->
+            try {
+                val target = resolveRelativeDocument(access.root, relativePath)
+                if (target == null || !target.isFile) {
+                    Log.w(TAG, "send-file missing: ${relativePath.normalizedPath}")
+                    return@withManagedRootForFileAction jsonResponse(
+                        404,
+                        JSONObject()
+                            .put("ok", false)
+                            .put("message", "File not found")
+                            .put("relativePath", relativePath.normalizedPath)
+                    )
+                }
+
+                val bytes = access.context.contentResolver.openInputStream(target.uri)?.use { input ->
+                    input.readBytes()
+                } ?: return@withManagedRootForFileAction jsonResponse(
+                    500,
+                    JSONObject()
+                        .put("ok", false)
+                        .put("message", "Unable to open file for reading")
+                        .put("relativePath", relativePath.normalizedPath)
+                )
+
+                Log.i(TAG, "send-file success: ${relativePath.normalizedPath}")
+                LocalSyncHttpServer.Response(
+                    statusCode = 200,
+                    bodyBytes = bytes,
+                    contentType = guessMimeTypeFromFileName(relativePath.fileName),
+                    extraHeaders = mapOf(
+                        "Content-Disposition" to "attachment; filename=${relativePath.fileName}",
+                        "X-Relative-Path" to relativePath.normalizedPath
+                    )
+                )
+            } catch (t: Throwable) {
+                Log.e(TAG, "send-file failed for ${relativePath.normalizedPath}", t)
+                jsonResponse(
+                    500,
+                    JSONObject()
+                        .put("ok", false)
+                        .put("message", t.message ?: "Send file failed")
+                        .put("relativePath", relativePath.normalizedPath)
+                )
+            }
+        }
+    }
+
+    private fun buildDeleteFileResponse(query: Map<String, String>): LocalSyncHttpServer.Response {
+        val rawRelativePath = query["relativePath"]
+        Log.i(TAG, "delete-file requested for relative path=${rawRelativePath.orEmpty()}")
+
+        val relativePath = parseManagedRelativePath(rawRelativePath)
+            ?: run {
+                Log.w(TAG, "delete-file rejected: invalid path=${rawRelativePath.orEmpty()}")
+                return jsonResponse(
+                    400,
+                    JSONObject()
+                        .put("ok", false)
+                        .put("message", "Invalid relative path")
+                        .put("relativePath", rawRelativePath ?: JSONObject.NULL)
+                )
+            }
+
+        return withManagedRootForFileAction("delete-file") { access ->
+            try {
+                val target = resolveRelativeDocument(access.root, relativePath)
+                if (target == null) {
+                    Log.w(TAG, "delete-file missing: ${relativePath.normalizedPath}")
+                    return@withManagedRootForFileAction jsonResponse(
+                        404,
+                        JSONObject()
+                            .put("ok", false)
+                            .put("message", "File not found")
+                            .put("relativePath", relativePath.normalizedPath)
+                    )
+                }
+
+                if (!target.isFile) {
+                    Log.w(TAG, "delete-file rejected: target is not a file ${relativePath.normalizedPath}")
+                    return@withManagedRootForFileAction jsonResponse(
+                        409,
+                        JSONObject()
+                            .put("ok", false)
+                            .put("message", "Target path is not a file")
+                            .put("relativePath", relativePath.normalizedPath)
+                    )
+                }
+
+                val deleted = try {
+                    target.delete()
+                } catch (t: Throwable) {
+                    Log.e(TAG, "delete-file failed during delete ${relativePath.normalizedPath}", t)
+                    false
+                }
+
+                if (!deleted) {
+                    return@withManagedRootForFileAction jsonResponse(
+                        500,
+                        JSONObject()
+                            .put("ok", false)
+                            .put("message", "Delete failed")
+                            .put("relativePath", relativePath.normalizedPath)
+                    )
+                }
+
+                Log.i(TAG, "delete-file success: ${relativePath.normalizedPath}")
+                jsonResponse(
+                    200,
+                    JSONObject()
+                        .put("ok", true)
+                        .put("message", "File deleted")
+                        .put("relativePath", relativePath.normalizedPath)
+                        .put("action", "deleted")
+                )
+            } catch (t: Throwable) {
+                Log.e(TAG, "delete-file failed for ${relativePath.normalizedPath}", t)
+                jsonResponse(
+                    500,
+                    JSONObject()
+                        .put("ok", false)
+                        .put("message", t.message ?: "Delete file failed")
+                        .put("relativePath", relativePath.normalizedPath)
+                )
+            }
         }
     }
 
@@ -1458,3 +1819,7 @@ class AppViewModel(
         }
     }
 }
+
+
+
+
